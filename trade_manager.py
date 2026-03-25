@@ -2,7 +2,7 @@
 
 import json
 import time
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 import requests
 from bs4 import BeautifulSoup
@@ -112,8 +112,6 @@ class TradeManager:
     def find_partner_card_instance(self, partner_id: int, card_id: int) -> Optional[int]:
         """
         Ищет instance_id карты у партнёра.
-
-        Обрабатывает: 419 (CSRF expired), 429 (rate limit), таймауты.
         """
         self._log(f"🔍 Поиск instance_id карты {card_id} у владельца {partner_id}...")
 
@@ -175,7 +173,7 @@ class TradeManager:
                     self._log(f"     🔄 Попытка {csrf_refresh_attempts}/{MAX_CSRF_REFRESH}")
                     if self._refresh_csrf_token():
                         time.sleep(2)
-                        continue  # повторяем тот же батч
+                        continue
                     return None
                 self._log("     ❌ Превышен лимит попыток обновления токена")
                 return None
@@ -252,23 +250,30 @@ class TradeManager:
     def create_trade_direct_api(
         self,
         receiver_id: int,
-        my_instance_id: int,
+        my_instance_ids: List[int],   # список instance_id карт отправителя (1 или 2)
         his_instance_id: int,
     ) -> bool:
-        """Создаёт обмен через API."""
-        if my_instance_id in self.locked_cards:
-            self._log(f"⚠️  Карта {my_instance_id} уже заблокирована!")
-            return False
+        """
+        Создаёт обмен через API.
+
+        my_instance_ids — список instance_id карт со стороны нашего аккаунта.
+        Обычно 1 карта, но при высоком числе владельцев буст-карты — 2 карты.
+        """
+        for iid in my_instance_ids:
+            if iid in self.locked_cards:
+                self._log(f"⚠️  Карта {iid} уже заблокирована!")
+                return False
 
         url = f"{BASE_URL}/trades/create"
         headers = self._prepare_headers(receiver_id)
-        data = [
-            ("receiver_id", int(receiver_id)),
-            ("creator_card_ids[]", int(my_instance_id)),
-            ("receiver_card_ids[]", int(his_instance_id)),
-        ]
 
-        self._log(f"⚡ Отправка: receiver={receiver_id}, my={my_instance_id}, his={his_instance_id}")
+        data = [("receiver_id", int(receiver_id))]
+        for iid in my_instance_ids:
+            data.append(("creator_card_ids[]", int(iid)))
+        data.append(("receiver_card_ids[]", int(his_instance_id)))
+
+        ids_str = ", ".join(str(i) for i in my_instance_ids)
+        self._log(f"⚡ Отправка: receiver={receiver_id}, my=[{ids_str}], his={his_instance_id}")
 
         try:
             self.limiter.wait_and_record()
@@ -307,8 +312,12 @@ class TradeManager:
 
             if self._is_success_response(response):
                 self._log("✅ Обмен успешно создан")
-                self.locked_cards.add(my_instance_id)
-                self._log(f"🔒 Карта {my_instance_id} заблокирована (всего: {len(self.locked_cards)})")
+                for iid in my_instance_ids:
+                    self.locked_cards.add(iid)
+                self._log(
+                    f"🔒 Заблокировано {len(my_instance_ids)} карт(ы) "
+                    f"(всего заблокировано: {len(self.locked_cards)})"
+                )
                 return True
 
             self._log(f"❌ Обмен не удался: {response.status_code}")

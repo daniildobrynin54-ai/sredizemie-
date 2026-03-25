@@ -5,7 +5,7 @@
 со всеми существующими импортами в проекте.
 """
 
-from typing import Optional
+from typing import List, Optional
 
 # Реэкспорт классов — все существующие `from trade import ...` продолжат работать
 from trade_history import TradeHistoryMonitor
@@ -23,9 +23,9 @@ def send_trade_to_owner(
     session,
     owner_id: int,
     owner_name: str,
-    my_instance_id: int,
+    my_instance_ids: List[int],          # список instance_id карт нашего аккаунта (1 или 2)
     his_card_id: int,
-    his_instance_id: Optional[int] = None,   # ← берётся из card_user_id на странице владельцев
+    his_instance_id: Optional[int] = None,
     my_card_name: str = "",
     my_wanters: int = 0,
     trade_manager: Optional[TradeManager] = None,
@@ -35,12 +35,15 @@ def send_trade_to_owner(
     """
     Отправляет обмен владельцу карты.
 
+    my_instance_ids — список instance_id карт со стороны нашего аккаунта.
+    Обычно 1 карта, но при высоком числе владельцев буст-карты передаются 2 карты.
+
     Если his_instance_id передан (спарсен из card_user_id в href страницы владельцев),
     поиск instance_id через API пропускается — экономится один сетевой запрос.
     """
-    if not my_instance_id:
+    if not my_instance_ids:
         if debug:
-            print("[TRADE] Отсутствует my_instance_id")
+            print("[TRADE] Отсутствует my_instance_ids")
         return False
 
     if not trade_manager:
@@ -53,8 +56,10 @@ def send_trade_to_owner(
         return False
 
     if dry_run:
-        instance_info = f"his_instance_id={his_instance_id}" if his_instance_id else "his_instance_id=нет (нужен поиск)"
-        print(f"[DRY-RUN] 📤 Обмен → {owner_name} ({instance_info})")
+        cards_count = len(my_instance_ids)
+        ids_str = str(my_instance_ids[0]) if cards_count == 1 else f"[{', '.join(str(i) for i in my_instance_ids)}]"
+        his_info = f"his_instance_id={his_instance_id}" if his_instance_id else "his_instance_id=нет (нужен поиск)"
+        print(f"[DRY-RUN] 📤 Обмен ({cards_count} карт(ы)) → {owner_name} (my={ids_str}, {his_info})")
         return True
 
     # Если instance_id не пришёл со страницы — ищем через API (запасной вариант)
@@ -67,7 +72,7 @@ def send_trade_to_owner(
         print(f"⚠️  Не удалось получить instance_id карты у {owner_name}")
         return False
 
-    success = trade_manager.create_trade_direct_api(owner_id, my_instance_id, his_instance_id)
+    success = trade_manager.create_trade_direct_api(owner_id, my_instance_ids, his_instance_id)
     if success:
         trade_manager.mark_trade_sent(owner_id, his_card_id)
 
