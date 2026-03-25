@@ -19,13 +19,38 @@ from trade import TradeManager
 from blacklist import get_blacklist_manager
 
 
+def get_cards_to_send_count(boost_card: dict) -> int:
+    """
+    Определяет сколько карт нужно отправить в одном обмене.
+
+    Логика:
+    - owners <= 108               → 1 карта (замена карты клуба, см. card_replacement.py)
+    - 109–216 owners + 121+ want  → 2 карты
+    - 217–360 owners + 181+ want  → 2 карты
+    - 361–540 owners + 300+ want  → 2 карты
+    - иначе                       → 1 карта
+
+    Returns:
+        1 или 2
+    """
+    owners  = boost_card.get("owners_count", 0)
+    wanters = boost_card.get("wanters_count", 0)
+
+    if 109 <= owners <= 216 and wanters >= 121:
+        return 2
+    if 217 <= owners <= 360 and wanters >= 181:
+        return 2
+    if 361 <= owners <= 540 and wanters >= 300:
+        return 2
+    return 1
+
+
 class Owner:
     """Класс владельца карты."""
 
     def __init__(self, owner_id: str, name: str, instance_id: Optional[int] = None):
         self.id = owner_id
         self.name = name
-        # instance_id карты у этого владельца — берётся из card_user_id в href
         self.instance_id: Optional[int] = instance_id
 
     def to_dict(self) -> Dict[str, str]:
@@ -39,21 +64,12 @@ class OwnersParser:
         self.session = session
         self.blacklist_manager = get_blacklist_manager()
 
-    # ------------------------------------------------------------------
-    # Извлечение данных из элемента владельца
-    # ------------------------------------------------------------------
-
     def _extract_user_id(self, owner_element) -> Optional[str]:
         href = owner_element.get("href", "")
         match = re.search(r"/users/(\d+)", href)
         return match.group(1) if match else None
 
     def _extract_card_user_id(self, owner_element) -> Optional[int]:
-        """
-        Извлекает instance_id карты из параметра card_user_id в href.
-
-        Пример href: /users/284219?card_user_id=437346806
-        """
         href = owner_element.get("href", "")
         match = re.search(r"card_user_id=(\d+)", href)
         return int(match.group(1)) if match else None
@@ -63,11 +79,6 @@ class OwnersParser:
         return name_elem.get_text(strip=True) if name_elem else "Неизвестно"
 
     def _is_owner_available(self, owner_element) -> bool:
-        """
-        Проверяет доступность владельца.
-
-        Игнорирует владельцев с замочком, иконкой рукопожатия или оффлайн-статусом.
-        """
         owner_classes = owner_element.get("class", [])
 
         if "card-show__owner--online" not in owner_classes:
@@ -88,10 +99,6 @@ class OwnersParser:
             return False
 
         return True
-
-    # ------------------------------------------------------------------
-    # Основной метод парсинга страницы
-    # ------------------------------------------------------------------
 
     def find_owners_on_page(
         self,
@@ -131,7 +138,6 @@ class OwnersParser:
                     continue
 
                 user_name = self._extract_user_name(owner_elem)
-                # Берём instance_id сразу из href — больше не нужен отдельный API-запрос
                 instance_id = self._extract_card_user_id(owner_elem)
 
                 available_owners.append(Owner(user_id, user_name, instance_id))
@@ -211,6 +217,46 @@ class OwnersProcessor:
         return False
 
     # ------------------------------------------------------------------
+    # Подбор нескольких карт для одного обмена
+    # ------------------------------------------------------------------
+
+    def _select_cards_for_trade(
+        self,
+        boost_card: Dict,
+        output_dir: str,
+        cards_needed: int,
+        base_exclude: Set[int],
+    ) -> List[Dict]:
+        """
+        Выбирает cards_needed карт одного ранга для обмена.
+
+        Каждая следующая карта исключает уже выбранные instance_id,
+        чтобы не отправить одну и ту же карту дважды.
+
+        Returns:
+            Список выбранных карт (может быть меньше cards_needed если инвентарь заканчивается).
+        """
+        selected = []
+        exclude = base_exclude.copy()
+
+        for _ in range(cards_needed):
+            card = self.select_card_func(
+                self.session,
+                boost_card,
+                output_dir,
+                trade_manager=self.trade_manager,
+                exclude_instances=exclude,
+            )
+            if not card:
+                break
+            selected.append(card)
+            # Исключаем только что выбранную карту для следующей итерации
+            if card.get("instance_id"):
+                exclude.add(card["instance_id"])
+
+        return selected
+
+    # ------------------------------------------------------------------
     # Обработка одного владельца
     # ------------------------------------------------------------------
 
@@ -227,14 +273,17 @@ class OwnersProcessor:
         """
         Обрабатывает владельца с до MAX_RETRY_ATTEMPTS попытками.
 
-        instance_id карты владельца берётся напрямую из owner.instance_id
-        (спарсен из card_user_id в href страницы владельцев) — API-запрос не нужен.
+        Количество карт в обмене определяется автоматически через
+        get_cards_to_send_count(boost_card): 1 или 2 карты.
 
         Returns:
             (успех обмена, нужно прервать обработку)
         """
         if self.blacklist_manager.is_blacklisted(owner.id):
             return False, False
+
+        # Сколько карт отправляем в этом обмене
+        cards_needed = get_cards_to_send_count(boost_card)
 
         # Проверка #1: перед началом обработки владельца
         if self._check_interruption(monitor_obj, f"перед владельцем {owner.name}"):
@@ -247,29 +296,35 @@ class OwnersProcessor:
             if self._check_interruption(monitor_obj, f"перед попыткой {attempt}/{self.MAX_RETRY_ATTEMPTS}"):
                 return False, True
 
-            selected_card = self.select_card_func(
-                self.session,
-                boost_card,
-                output_dir,
-                trade_manager=self.trade_manager,
-                exclude_instances=exclude_instances,
+            selected_cards = self._select_cards_for_trade(
+                boost_card, output_dir, cards_needed, exclude_instances
             )
 
-            if not selected_card:
+            if not selected_cards:
                 msg = "❌ Не удалось подобрать карту" if attempt == 1 else "❌ Карт больше нет"
                 print(f"   [{index}/{total}] {owner.name} → {msg}")
                 return False, False
 
-            card_name = selected_card.get("name", "")
-            wanters = selected_card.get("wanters_count", 0)
-            my_instance_id = selected_card.get("instance_id")
+            # Формируем строку для лога
+            if len(selected_cards) == 1:
+                c = selected_cards[0]
+                trade_label = f"{c['name']} ({c['wanters_count']} желающих)"
+            else:
+                parts = ", ".join(
+                    f"{c['name']} ({c['wanters_count']}♥)" for c in selected_cards
+                )
+                trade_label = f"2 карты: {parts}"
 
             if attempt == 1:
-                print(f"   [{index}/{total}] {owner.name} → {card_name} ({wanters} желающих)")
+                print(f"   [{index}/{total}] {owner.name} → {trade_label}")
             else:
-                print(f"      Попытка {attempt}/{self.MAX_RETRY_ATTEMPTS}: {card_name} ({wanters} желающих)")
+                print(f"      Попытка {attempt}/{self.MAX_RETRY_ATTEMPTS}: {trade_label}")
 
-            if not self.send_trade_func or not my_instance_id:
+            my_instance_ids = [c["instance_id"] for c in selected_cards if c.get("instance_id")]
+            my_card_name    = ", ".join(c.get("name", "") for c in selected_cards)
+            my_wanters      = selected_cards[0].get("wanters_count", 0)
+
+            if not self.send_trade_func or not my_instance_ids:
                 return False, False
 
             self._wait_before_trade()
@@ -278,16 +333,15 @@ class OwnersProcessor:
             if self._check_interruption(monitor_obj, "перед отправкой обмена"):
                 return False, True
 
-            # instance_id карты у владельца уже известен из страницы — передаём напрямую
             success = self.send_trade_func(
                 session=self.session,
                 owner_id=int(owner.id),
                 owner_name=owner.name,
-                my_instance_id=my_instance_id,
+                my_instance_ids=my_instance_ids,       # список (1 или 2 карты)
                 his_card_id=his_card_id,
-                his_instance_id=owner.instance_id,   # ← готовый instance_id
-                my_card_name=card_name,
-                my_wanters=wanters,
+                his_instance_id=owner.instance_id,
+                my_card_name=my_card_name,
+                my_wanters=my_wanters,
                 trade_manager=self.trade_manager,
                 dry_run=self.dry_run,
                 debug=self.debug,
@@ -300,10 +354,13 @@ class OwnersProcessor:
                 self.failed_attempts_set.clear()
                 return True, False
             else:
-                self.failed_attempts_set.add(my_instance_id)
-                exclude_instances.add(my_instance_id)
+                # Добавляем ВСЕ отправленные карты в failed_attempts_set
+                for iid in my_instance_ids:
+                    self.failed_attempts_set.add(iid)
+                    exclude_instances.add(iid)
+
                 if attempt < self.MAX_RETRY_ATTEMPTS:
-                    print(f"      ⚠️  Попытка {attempt} не удалась, пробуем другую карту...")
+                    print(f"      ⚠️  Попытка {attempt} не удалась, пробуем другие карты...")
                     time.sleep(1)
                 else:
                     print(f"      ❌ Все {self.MAX_RETRY_ATTEMPTS} попытки исчерпаны")
@@ -326,8 +383,17 @@ class OwnersProcessor:
         total_trades_sent = 0
         page = 1
 
+        # Показываем режим отправки карт
+        cards_per_trade = get_cards_to_send_count(boost_card)
+        owners = boost_card.get("owners_count", 0)
+        wanters = boost_card.get("wanters_count", 0)
+
         print(f"🔍 Поиск доступных владельцев карты {card_id}...")
         print(f"📊 Режим: {'DRY-RUN (тестовый)' if self.dry_run else 'БОЕВОЙ (реальные обмены)'}")
+        print(
+            f"🃏 Карт в обмене: {cards_per_trade} "
+            f"(владельцев буст-карты: {owners}, желающих: {wanters})"
+        )
 
         blacklist_info = self.blacklist_manager.get_blacklist_info()
         if blacklist_info["count"] > 0:
@@ -343,21 +409,20 @@ class OwnersProcessor:
             if self._check_interruption(monitor_obj, f"перед страницей {page}"):
                 return total_processed
 
-            owners, has_next = self.parser.find_owners_on_page(card_id, page)
+            owners_list, has_next = self.parser.find_owners_on_page(card_id, page)
 
-            if owners:
-                # Считаем сколько владельцев с уже известным instance_id
-                with_instance = sum(1 for o in owners if o.instance_id is not None)
+            if owners_list:
+                with_instance = sum(1 for o in owners_list if o.instance_id is not None)
                 print(
-                    f"📊 Страница {page}: найдено владельцев — {len(owners)} "
-                    f"(instance_id: {with_instance}/{len(owners)})"
+                    f"📊 Страница {page}: найдено владельцев — {len(owners_list)} "
+                    f"(instance_id: {with_instance}/{len(owners_list)})"
                 )
 
-                for idx, owner in enumerate(owners, 1):
+                for idx, owner in enumerate(owners_list, 1):
                     # Проверка #2: перед каждым владельцем
                     if self._check_interruption(
                         monitor_obj,
-                        f"перед владельцем {idx}/{len(owners)} на странице {page}",
+                        f"перед владельцем {idx}/{len(owners_list)} на странице {page}",
                     ):
                         return total_processed
 
@@ -367,7 +432,7 @@ class OwnersProcessor:
                         output_dir,
                         int(card_id),
                         idx,
-                        len(owners),
+                        len(owners_list),
                         monitor_obj,
                     )
 
@@ -378,7 +443,7 @@ class OwnersProcessor:
                     if success:
                         total_trades_sent += 1
 
-                total_processed += len(owners)
+                total_processed += len(owners_list)
                 print()
             else:
                 print(f"📊 Страница {page}: подходящих владельцев — 0\n")
